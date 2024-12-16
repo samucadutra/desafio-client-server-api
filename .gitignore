@@ -23,3 +23,7 @@ go.work.sum
 
 # env file
 .env
+/.idea/desafio-client-server-api.iml
+/.idea/modules.xml
+/.idea/vcs.xml
+/.idea/dataSources.xml

@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 	"io"
+	"log"
 	"net/http"
 	"time"
 )
@@ -25,56 +27,90 @@ type Cotacao struct {
 	} `json:"USDBRL"`
 }
 
-func main() {
-	http.HandleFunc("/", BuscaCotacaoDolarHandler)
-	http.ListenAndServe(":8080", nil)
+type cotacaoEntity struct {
+	gorm.Model
+	Code       string
+	Codein     string
+	Name       string
+	High       string
+	Low        string
+	VarBid     string
+	PctChange  string
+	Bid        string
+	Ask        string
+	Timestamp  string
+	CreateDate string
 }
 
-func BuscaCotacaoDolarHandler(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		w.WriteHeader(http.StatusNotFound)
-		return
+type PriceResponse struct {
+	Bid string `json:"bid"`
+}
+
+func main() {
+	db := initDB()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cotacao", func(w http.ResponseWriter, r *http.Request) {
+		cotacao, err := buscaCotacaoDolarApiExterna()
+		if err != nil {
+			if err.Error() == context.DeadlineExceeded.Error() {
+				log.Println("Erro de timeout ao buscar cotação: ", err)
+				w.WriteHeader(http.StatusRequestTimeout)
+				return
+			} else {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		}
+
+		err = salvarCotacaoBancoDeDados(db, cotacao)
+		if err != nil {
+			if err.Error() == context.DeadlineExceeded.Error() {
+				log.Println("Erro de timeout ao salvar cotação no banco de dados: ", err)
+				w.WriteHeader(http.StatusRequestTimeout)
+				return
+			} else {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+
+		json.NewEncoder(w).Encode(PriceResponse{Bid: cotacao.Usdbrl.Bid})
+	})
+
+	http.ListenAndServe(":8080", mux)
+
+}
+
+func initDB() *gorm.DB {
+	db, err := gorm.Open(sqlite.Open("cotacao.db"), &gorm.Config{})
+	if err != nil {
+		log.Fatal("Error connecting to DB: ", err)
 	}
+	err = db.AutoMigrate(&cotacaoEntity{})
+	if err != nil {
+		log.Fatal("Error migrating DB: ", err)
+	}
+	return db
+}
+
+func buscaCotacaoDolarApiExterna() (*Cotacao, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-
-	cotacao, err := buscaCotacaoDolarApiExterna(ctx)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	err = salvarCotacaoBancoDeDados(ctx, cotacao)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	json.NewEncoder(w).Encode(cotacao)
-
-	//select {
-	//case <-ctx.Done():
-	//	fmt.Println("Get  cancelled. Timeout reached.")
-	//	return
-	//case <-time.After(1 * time.Second):
-	//	fmt.Println("Hotel booked.")
-	//}
-}
-
-func buscaCotacaoDolarApiExterna(ctx context.Context) (*Cotacao, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://economia.awesomeapi.com.br/json/last/USD-BRL", nil)
 	if err != nil {
 		return nil, err
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		if ctx.Err().Error() == context.DeadlineExceeded.Error() {
+			return nil, context.DeadlineExceeded
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
@@ -85,10 +121,35 @@ func buscaCotacaoDolarApiExterna(ctx context.Context) (*Cotacao, error) {
 	if err != nil {
 		return nil, err
 	}
+	log.Println("Cotacao buscada com sucesso: ", cotacao)
 	return &cotacao, nil
 }
 
-func salvarCotacaoBancoDeDados(ctx context.Context, cotacao *Cotacao) error {
-	fmt.Println("Salvando a cotação do ativo: ", cotacao.Usdbrl.Name, " no valor de: ", cotacao.Usdbrl.Bid)
-	return nil
+func salvarCotacaoBancoDeDados(db *gorm.DB, cotacao *Cotacao) error {
+	log.Println("Salvando a cotação do ativo: ", cotacao.Usdbrl.Name, " no valor de: ", cotacao.Usdbrl.Bid)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	db.WithContext(ctx).Create(&cotacaoEntity{
+		Code:       cotacao.Usdbrl.Code,
+		Codein:     cotacao.Usdbrl.Codein,
+		Name:       cotacao.Usdbrl.Name,
+		High:       cotacao.Usdbrl.High,
+		Low:        cotacao.Usdbrl.Low,
+		VarBid:     cotacao.Usdbrl.VarBid,
+		PctChange:  cotacao.Usdbrl.PctChange,
+		Bid:        cotacao.Usdbrl.Bid,
+		Ask:        cotacao.Usdbrl.Ask,
+		Timestamp:  cotacao.Usdbrl.Timestamp,
+		CreateDate: cotacao.Usdbrl.CreateDate,
+	})
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		log.Println("cotação do ativo: ", cotacao.Usdbrl.Name, " no valor de: ", cotacao.Usdbrl.Bid, " foi salva com sucesso!")
+		return nil
+	}
 }
